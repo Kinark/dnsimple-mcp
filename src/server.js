@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { normalizeCommand, usage } from './catalog.js';
 import { CliError, UsageError, createCli } from './cli.js';
 import { LoginError, callbackOf, createLoginManager, isHeadless } from './login.js';
+import { createClientSignIn } from './elicit.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -15,8 +16,9 @@ Read with dnsimple_query, change things with dnsimple_mutate. Both take a CLI co
 
 Before any dnsimple_mutate call that deletes data or costs money (registering, transferring, renewing or restoring a domain, buying a certificate, enabling paid services), show the user exactly what will happen, including the price from "registrar prices", and wait for explicit confirmation.`;
 
-const AUTH_STDIO = 'Authentication is OAuth in the user\'s browser: if a call reports "not authenticated", call dnsimple_auth_login and ask the user to approve the request in the browser window that opens. API tokens are never used or accepted.';
-const AUTH_HEADLESS = 'Authentication is OAuth, and this server runs where no browser can be opened, so signing in takes two steps. If a call reports "not signed in": (1) call dnsimple_auth_login and give the user the authorize_url it returns; they open it in a browser on any computer and approve. (2) Their browser then lands on an address starting with http://127.0.0.1 that fails to load, which is expected; ask them to copy that whole address from the address bar, and pass it to dnsimple_auth_complete as redirect_url. API tokens are never used or accepted.';
+const AUTH_PROMPTED = 'Authentication is OAuth. When a call needs it, the server asks the user to sign in through the MCP client (a DNSimple link to approve) and then retries the call by itself, so just make the call. Only if a call still reports "not signed in" (a client that cannot show such prompts) follow this: ';
+const AUTH_STDIO = AUTH_PROMPTED + 'If a call reports "not authenticated", call dnsimple_auth_login and ask the user to approve the request in the browser window that opens. API tokens are never used or accepted.';
+const AUTH_HEADLESS = AUTH_PROMPTED + 'this server runs where no browser can be opened, so signing in takes two steps. If a call reports "not signed in": (1) call dnsimple_auth_login and give the user the authorize_url it returns; they open it in a browser on any computer and approve. (2) Their browser then lands on an address starting with http://127.0.0.1 that fails to load, which is expected; ask them to copy that whole address from the address bar, and pass it to dnsimple_auth_complete as redirect_url. API tokens are never used or accepted.';
 const AUTH_HTTP = 'Authentication is OAuth on the MCP connection itself: the user signs in with DNSimple in their browser when the client connects. If a call reports "not authenticated", the DNSimple session ended; ask the user to re-authenticate this MCP server in their client. API tokens are never used or accepted.';
 
 const commandInput = {
@@ -53,7 +55,9 @@ export async function createServer({
   function failure(error) {
     let message = error instanceof Error ? error.message : String(error);
     if (error instanceof LoginError && error.restart && !http) {
-      message += '\n\nCall dnsimple_auth_login to start a new sign-in and get a fresh authorize_url.';
+      message += prompted?.canPrompt()
+        ? '\n\nRetry the call to be asked to sign in again.'
+        : '\n\nCall dnsimple_auth_login to start a new sign-in and get a fresh authorize_url.';
     } else if (error instanceof CliError && isAuthError(message)) {
       http?.onAuthLost?.();
       message += http
@@ -63,8 +67,8 @@ export async function createServer({
     return { ...text(message), isError: true };
   }
 
-  const guard = (fn) => async (input) => {
-    try { return await fn(input); } catch (error) { return failure(error); }
+  const guard = (fn) => async (input, extra) => {
+    try { return await fn(input, extra); } catch (error) { return failure(error); }
   };
 
   // A missing or unparseable CLI must not stop the server from starting: the
@@ -73,6 +77,8 @@ export async function createServer({
   try { ({ commands } = await cli.catalog()); } catch {}
 
   const server = new McpServer({ name: 'dnsimple', version: pkg.version }, { instructions: INSTRUCTIONS.replace('__AUTH__', http ? AUTH_HTTP : headless ? AUTH_HEADLESS : AUTH_STDIO) });
+  // Over HTTP the connection's own OAuth flow signs in instead.
+  const prompted = http ? null : createClientSignIn({ server, cli, login, headless });
 
   async function authState() {
     const state = { authenticated: false };
@@ -125,7 +131,7 @@ export async function createServer({
       const { stdout } = await cli.exec(['ai']);
       return text(
         '> Running through the DNSimple MCP: run commands with dnsimple_query (reads) and dnsimple_mutate (changes); ' +
-        (http ? 'authentication is handled by the MCP connection. ' : 'authenticate with dnsimple_auth_login instead of `dnsimple auth login`. ') +
+        (http ? 'authentication is handled by the MCP connection. ' : 'sign-in is prompted by the client when a call needs it (otherwise use dnsimple_auth_login, never `dnsimple auth login`). ') +
         '--json and --yes are applied automatically.\n\n' + stdout,
       );
     }
@@ -136,14 +142,21 @@ export async function createServer({
     return text(stdout);
   }));
 
-  const runCommand = (expectReadOnly) => guard(async (input) => {
+  const runCommand = (expectReadOnly) => guard(async (input, extra) => {
     const { argv, path, readOnly } = await cli.buildArgs(input);
     if (readOnly !== expectReadOnly) {
       throw new UsageError(readOnly
         ? `"${path}" only reads data; call it with dnsimple_query.`
         : `"${path}" changes data; call it with dnsimple_mutate.`);
     }
-    return text(await cli.run(argv));
+    try {
+      return text(await cli.run(argv));
+    } catch (error) {
+      // Signed out: let the client prompt for sign-in, then run it once more.
+      if (!prompted || !(error instanceof CliError) || !isAuthError(error.message) || !prompted.canPrompt()) throw error;
+      await prompted.signIn({}, extra);
+      return text(await cli.run(argv));
+    }
   });
 
   server.registerTool('dnsimple_query', {
@@ -190,7 +203,11 @@ export async function createServer({
       wait_seconds: z.number().int().min(0).max(300).optional().describe(headless ? 'Ignored here: the link is returned immediately.' : 'How long to wait for the user to approve (default 45).'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, guard(async ({ sandbox, name, wait_seconds = 45 }) => {
+  }, guard(async ({ sandbox, name, wait_seconds = 45 }, extra) => {
+    if (prompted.canPrompt()) {
+      await prompted.signIn({ sandbox, name }, extra);
+      return text({ status: 'authenticated', ...(await authState()), login: undefined });
+    }
     await cli.ensure();
     const session = login.start({ sandbox, name, noBrowser: headless, headless });
     await login.waitForUrl(session);

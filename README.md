@@ -38,7 +38,7 @@ The client shows the server as needing authentication (in Claude Code: `/mcp`, p
 
 How it works: the MCP endpoint is an OAuth 2.1 protected resource and the server is its own authorization server (protected-resource and authorization-server metadata, dynamic client registration, PKCE, refresh tokens), as the MCP authorization spec describes. DNSimple has no dynamic client registration, so the server delegates the actual sign-in to `dnsimple auth login`. The tokens your client receives are opaque handles to this server; the DNSimple credential stays in the CLI's store. Signing out with `dnsimple_auth_logout` or `dnsimple auth logout` ends the connection's session and the client asks for OAuth again.
 
-### stdio: sign in through a tool
+### stdio: the client prompts for sign-in
 
 Claude Code:
 
@@ -59,7 +59,7 @@ Any other MCP client:
 }
 ```
 
-A stdio connection has no OAuth step in MCP, so here the assistant signs in with the `dnsimple_auth_login` tool, which opens the same DNSimple consent page. If you are already signed in with the CLI, it works immediately.
+When a call needs DNSimple and you're signed out, your client asks you to sign in and opens the DNSimple consent page. Once you approve, the call goes ahead by itself. If you're already signed in with the CLI, it works immediately. Clients that can't show MCP prompts fall back to the `dnsimple_auth_login` tool.
 
 `--allow-git=all` is needed on npm 12+, which refuses packages from git by default. Or run either mode from a clone:
 
@@ -72,28 +72,35 @@ node bin/dnsimple-mcp.js --http
 
 `ghcr.io/kinark/dnsimple-mcp` (linux/amd64 and linux/arm64) contains Node, a pinned `dnsimple` CLI and this server. Nothing else is needed on the host. It runs as a non-root user, and the `/data` volume holds everything that must survive a restart: the CLI's credential store and this server's state. Keep the volume and a restarted container is still signed in.
 
-The image is an HTTP server, so the MCP connection itself asks for OAuth:
+One config entry is all it takes: your MCP client starts the container itself.
 
 ```sh
-docker run -d --name dnsimple-mcp --restart unless-stopped \
-  -p 8377:8377 -v dnsimple-mcp:/data ghcr.io/kinark/dnsimple-mcp
-docker logs dnsimple-mcp        # shows the access key the sign-in page asks for
-claude mcp add --transport http dnsimple http://127.0.0.1:8377/mcp
+claude mcp add dnsimple -- docker run -i --rm -v dnsimple-mcp:/data ghcr.io/kinark/dnsimple-mcp
 ```
 
 ```json
 {
   "mcpServers": {
-    "dnsimple": { "type": "http", "url": "http://127.0.0.1:8377/mcp" }
+    "dnsimple": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-v", "dnsimple-mcp:/data", "ghcr.io/kinark/dnsimple-mcp"]
+    }
   }
 }
 ```
 
-Then authenticate the server in your client (Claude Code: `/mcp` → dnsimple → Authenticate).
+The first call that needs DNSimple makes your client ask you to sign in (MCP elicitation, supported by current Claude Code). It opens the DNSimple consent page, and after you approve, your browser lands on a `http://127.0.0.1:…/callback` page that can't be reached, because the CLI that waits for it is inside the container. The client then asks for that address. Paste it in and the call goes ahead. You only do this once per volume. Clients that can't show these prompts fall back to the `dnsimple_auth_login` / `dnsimple_auth_complete` tools.
 
-To run it as a stdio command instead (sign-in through the `dnsimple_auth_login` tool), add `--stdio`: `docker run -i --rm -v dnsimple-mcp:/data ghcr.io/kinark/dnsimple-mcp --stdio`.
+To run it as a long-lived HTTP server instead, where the connection's own OAuth flow signs in, add `--http` and publish the port:
 
-That answers on `http://127.0.0.1:8377/mcp` of the Docker host. To reach it under any other address (another port, a host name, a reverse proxy), say so with `--public-url`; see [Remote and headless hosts](#remote-and-headless-hosts).
+```sh
+docker run -d --name dnsimple-mcp --restart unless-stopped \
+  -p 8377:8377 -v dnsimple-mcp:/data ghcr.io/kinark/dnsimple-mcp --http
+docker logs dnsimple-mcp        # shows the access key the sign-in page asks for
+claude mcp add --transport http dnsimple http://127.0.0.1:8377/mcp
+```
+
+In HTTP mode it answers on `http://127.0.0.1:8377/mcp` of the Docker host. To reach it under any other address (another port, a host name, a reverse proxy), say so with `--public-url`; see [Remote and headless hosts](#remote-and-headless-hosts).
 
 If you bind-mount a host directory instead of a named volume, it must be writable by uid 1000. Use one container per volume: a sign-in is finished by the container that started it.
 
@@ -159,7 +166,7 @@ The request is checked against the catalog before the CLI runs: unknown commands
 | Option | Effect |
 | --- | --- |
 | `--context <name>` or `DNSIMPLE_MCP_CONTEXT` | Pin every call to one stored CLI context (safe alongside other agents; disables switching). |
-| `--http` / `--stdio` or `DNSIMPLE_MCP_TRANSPORT` | Transport (default stdio; `http` in the Docker image). |
+| `--http` / `--stdio` or `DNSIMPLE_MCP_TRANSPORT` | Transport (default stdio, in the Docker image too). |
 | `--port <n>` or `DNSIMPLE_MCP_PORT` | Serve over HTTP with OAuth on the connection (default port 8377). |
 | `--host <addr>` or `DNSIMPLE_MCP_HOST` | With `--http`: address to bind (default `127.0.0.1`; `0.0.0.0` in the Docker image). |
 | `--public-url <url>` or `DNSIMPLE_MCP_PUBLIC_URL` | With `--http`: the base URL clients reach the server at. OAuth metadata is built from it. |

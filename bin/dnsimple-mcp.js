@@ -13,7 +13,7 @@ Usage:
       HTTP server (127.0.0.1 by default). The MCP connection itself asks for
       OAuth: the client opens a sign-in page that signs you in with DNSimple.
   dnsimple-mcp --stdio [--context <name>]
-      stdio server. Sign-in happens through the dnsimple_auth_login tool.
+      stdio server. Sign-in is prompted by the MCP client when a call needs it.
       Without --http or --stdio, DNSIMPLE_MCP_TRANSPORT decides (default stdio;
       the Docker image sets http).
 

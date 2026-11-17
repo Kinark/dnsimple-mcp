@@ -9,11 +9,14 @@ const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url),
 
 const INSTRUCTIONS = `DNSimple (domains, DNS zones and records, certificates, registrar) through the official dnsimple CLI.
 
-Authentication is OAuth in the user's browser: if a call reports "not authenticated", call dnsimple_auth_login and ask the user to approve the request in the browser window that opens. API tokens are never used or accepted.
+__AUTH__
 
 Read with dnsimple_query, change things with dnsimple_mutate. Both take a CLI command path ("zones records list"), positional \`args\` and a \`flags\` object. dnsimple_guide prints the full reference or the help of one command.
 
 Before any dnsimple_mutate call that deletes data or costs money (registering, transferring, renewing or restoring a domain, buying a certificate, enabling paid services), show the user exactly what will happen, including the price from "registrar prices", and wait for explicit confirmation.`;
+
+const AUTH_STDIO = 'Authentication is OAuth in the user\'s browser: if a call reports "not authenticated", call dnsimple_auth_login and ask the user to approve the request in the browser window that opens. API tokens are never used or accepted.';
+const AUTH_HTTP = 'Authentication is OAuth on the MCP connection itself: the user signs in with DNSimple in their browser when the client connects. If a call reports "not authenticated", the DNSimple session ended; ask the user to re-authenticate this MCP server in their client. API tokens are never used or accepted.';
 
 const commandInput = {
   command: z.string().describe('CLI command path without the "dnsimple" prefix, e.g. "zones records list".'),
@@ -29,20 +32,7 @@ const text = (value) => ({
   content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
 });
 
-function failure(error) {
-  let message = error instanceof Error ? error.message : String(error);
-  if (error instanceof CliError && /not authenticated|authentication failed|401|unauthorized/i.test(message)) {
-    message += '\n\nCall dnsimple_auth_login to sign in with OAuth, then retry.';
-  }
-  return { ...text(message), isError: true };
-}
-
-const guard = (fn) => async (input) => {
-  try { return await fn(input); } catch (error) {
-    if (error instanceof UsageError || error instanceof CliError) return failure(error);
-    return failure(error);
-  }
-};
+export const isAuthError = (message) => /not authenticated|authentication failed|401|unauthorized/i.test(message);
 
 function index(commands, readOnly) {
   return [...commands.values()]
@@ -51,16 +41,33 @@ function index(commands, readOnly) {
     .join('\n');
 }
 
-export async function createServer({ bin, context } = {}) {
-  const cli = createCli({ bin, context });
-  const login = createLoginManager(cli);
+/**
+ * `http` is set when the server is reached over HTTP, where sign-in happens in
+ * the connection's OAuth flow: { onAuthLost(), onLogout() }. `cli` and `login`
+ * can be shared between the per-request servers of that mode.
+ */
+export async function createServer({ bin, context, cli = createCli({ bin, context }), login = createLoginManager(cli), http } = {}) {
+  function failure(error) {
+    let message = error instanceof Error ? error.message : String(error);
+    if (error instanceof CliError && isAuthError(message)) {
+      http?.onAuthLost?.();
+      message += http
+        ? '\n\nThe DNSimple session ended. Ask the user to re-authenticate this MCP server in their client, then retry.'
+        : '\n\nCall dnsimple_auth_login to sign in with OAuth, then retry.';
+    }
+    return { ...text(message), isError: true };
+  }
+
+  const guard = (fn) => async (input) => {
+    try { return await fn(input); } catch (error) { return failure(error); }
+  };
 
   // A missing or unparseable CLI must not stop the server from starting: the
   // tools then report the real problem when called.
   let commands = new Map();
   try { ({ commands } = await cli.catalog()); } catch {}
 
-  const server = new McpServer({ name: 'dnsimple', version: pkg.version }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: 'dnsimple', version: pkg.version }, { instructions: INSTRUCTIONS.replace('__AUTH__', http ? AUTH_HTTP : AUTH_STDIO) });
 
   async function authState() {
     const state = { authenticated: false };
@@ -87,7 +94,8 @@ export async function createServer({ bin, context } = {}) {
       const { stdout } = await cli.exec(['ai']);
       return text(
         '> Running through the DNSimple MCP: run commands with dnsimple_query (reads) and dnsimple_mutate (changes); ' +
-        'authenticate with dnsimple_auth_login instead of `dnsimple auth login`. --json and --yes are applied automatically.\n\n' + stdout,
+        (http ? 'authentication is handled by the MCP connection. ' : 'authenticate with dnsimple_auth_login instead of `dnsimple auth login`. ') +
+        '--json and --yes are applied automatically.\n\n' + stdout,
       );
     }
     const { aliases } = await cli.catalog();
@@ -132,7 +140,8 @@ export async function createServer({ bin, context } = {}) {
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, guard(async () => text(await authState())));
 
-  server.registerTool('dnsimple_auth_login', {
+  // Over HTTP the connection's OAuth flow is the login.
+  if (!http) server.registerTool('dnsimple_auth_login', {
     title: 'Sign in to DNSimple (OAuth)',
     description:
       'Sign in to DNSimple with OAuth: opens the DNSimple authorization page in the user\'s browser and completes once they approve. No token is typed, shown or stored by this server. ' +
@@ -178,15 +187,17 @@ export async function createServer({ bin, context } = {}) {
 
   server.registerTool('dnsimple_auth_logout', {
     title: 'Sign out of DNSimple',
-    description: 'Remove a stored authentication context from this machine (defaults to the active one). Only do it when the user asks.',
+    description: 'Remove a stored authentication context from this machine (defaults to the active one). Only do it when the user asks.' +
+      (http ? ' The MCP connection is signed out too and asks for OAuth again.' : ''),
     inputSchema: { name: z.string().regex(/^[\w.-]+$/).optional().describe('Context to remove.') },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   }, guard(async ({ name }) => {
     login.cancel();
     const target = name || cli.context;
     await cli.exec(['auth', 'logout', ...(target ? ['--name', target] : [])]);
+    http?.onLogout?.();
     return text(await authState());
   }));
 
-  return { server, close: () => login.cancel() };
+  return { server, cli, login, close: () => login.cancel() };
 }

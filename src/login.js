@@ -68,7 +68,7 @@ export function createLoginManager(cli) {
     try { process.kill(-s.child.pid, 'SIGTERM'); } catch { try { s.child.kill('SIGTERM'); } catch {} }
   }
 
-  function start({ sandbox = false, name } = {}) {
+  function start({ sandbox = false, name, noBrowser = false } = {}) {
     if (session?.state === 'pending') return session;
 
     const args = ['auth', 'login'];
@@ -89,7 +89,13 @@ export function createLoginManager(cli) {
     makeShims(dir, cli.env);
 
     const child = spawn(pty[0], pty[1], {
-      env: { ...cli.env, PATH: `${dir}${delimiter}${cli.env.PATH || ''}`, DNSIMPLE_MCP_URL_FILE: urlFile },
+      env: {
+        ...cli.env,
+        PATH: `${dir}${delimiter}${cli.env.PATH || ''}`,
+        DNSIMPLE_MCP_URL_FILE: urlFile,
+        // The caller sends the browser to the URL itself.
+        ...(noBrowser && { DNSIMPLE_MCP_NO_BROWSER: '1' }),
+      },
       // stdin must be /dev/null: macOS `script` aborts (tcgetattr) on a pipe.
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,

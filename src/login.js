@@ -102,8 +102,12 @@ export function createLoginManager(cli, { ttlMs = Number(process.env.DNSIMPLE_MC
 
   function kill(s) {
     if (!s || s.state !== 'pending') return;
-    // `script` and the CLI share a process group; signal both.
-    try { process.kill(-s.child.pid, 'SIGTERM'); } catch { try { s.child.kill('SIGTERM'); } catch {} }
+    // `script` and the CLI share a process group on macOS; signal both.
+    // util-linux `script` runs the CLI in its own session and does not pass a
+    // SIGTERM on reliably; killing `script` closes the pty, which hangs the CLI
+    // up. Done at once because this also runs right before the process exits.
+    const signal = process.platform === 'linux' ? 'SIGKILL' : 'SIGTERM';
+    try { process.kill(-s.child.pid, signal); } catch { try { s.child.kill(signal); } catch {} }
   }
 
   /**
@@ -160,7 +164,7 @@ export function createLoginManager(cli, { ttlMs = Number(process.env.DNSIMPLE_MC
     child.stderr.on('data', onData);
 
     s.done = new Promise((resolve) => {
-      const finish = (state, error) => {
+      const finish = s.finish = (state, error) => {
         if (s.state !== 'pending') return;
         readUrl(s);
         s.state = state;
@@ -174,12 +178,16 @@ export function createLoginManager(cli, { ttlMs = Number(process.env.DNSIMPLE_MC
         // The CLI's own "Error: …" line; what follows it is a hint to use an API token.
         const lines = s.output.replace(/[\x00-\x08\x0b-\x1f]/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
         const text = lines.findLast((l) => l.startsWith('Error: '))?.slice(7) || lines.at(-1) || '';
-        if (s.expired) return finish('cancelled', `The sign-in was not completed within ${Math.round(lifetime / 60_000) || 1} minute(s) and expired.`);
         finish(signal ? 'cancelled' : 'failed', signal ? `Login ended (${signal}).` : text || `Login exited with code ${code}.`);
       });
     });
 
-    s.timer = setTimeout(() => { s.expired = true; kill(s); }, lifetime);
+    // Expiry takes effect now, not when the processes get around to exiting.
+    s.timer = setTimeout(() => {
+      s.expired = true;
+      kill(s);
+      s.finish('cancelled', `The sign-in was not completed within ${Math.round(lifetime / 60_000) || 1} minute(s) and expired.`);
+    }, lifetime);
     s.timer.unref();
     return s;
   }

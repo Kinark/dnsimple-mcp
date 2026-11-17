@@ -1,0 +1,7 @@
+*
+!package.json
+!package-lock.json
+!bin
+!src
+!LICENSE
+!README.md

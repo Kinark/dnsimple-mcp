@@ -1,11 +1,11 @@
 import { createServer as createHttpServer } from 'node:http';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createCli } from './cli.js';
-import { createLoginManager } from './login.js';
+import { createLoginManager, isHeadless } from './login.js';
 import { createServer, isAuthError } from './server.js';
 
 // The MCP endpoint is an OAuth 2.1 protected resource and this process is its
@@ -24,6 +24,8 @@ const REQUEST_TTL = 15 * 60;
 const AUTH_CACHE_MS = 60_000;
 const MAX_CLIENTS = 200;
 const MAX_BODY = 4 * 1024 * 1024;
+const MAX_KEY_FAILURES = 10; // per minute, across all callers
+const MIN_KEY_LENGTH = 16;
 
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]']);
 const now = () => Math.floor(Date.now() / 1000);
@@ -53,6 +55,38 @@ function redirectMatches(registered, requested) {
   if (!a || !b || !isLoopbackUrl(a) || !isLoopbackUrl(b)) return false;
   a.port = ''; b.port = '';
   return a.href === b.href;
+}
+
+/** "example.com" or "example.com:8443" (a rule without a port matches any port). */
+function parseHostRule(value) {
+  const m = /^(.+?)(?::(\d+))?$/.exec(String(value).trim().toLowerCase());
+  return m && !/[\s/@]/.test(m[1]) ? { name: m[1], port: m[2] ?? null } : null;
+}
+
+/** The externally visible base URL, without a trailing slash. */
+function normalizeBase(value) {
+  const url = parseUrl(String(value).trim());
+  if (!url || !['http:', 'https:'].includes(url.protocol) || url.search || url.hash || url.username) {
+    throw new Error(`The public URL must be an http(s) URL without query or fragment, e.g. https://dns-mcp.example.com (got "${value}").`);
+  }
+  return url.origin + url.pathname.replace(/\/+$/, '');
+}
+
+/**
+ * The key the sign-in page asks for when the server is reachable from other
+ * machines. Generated once and kept next to the token store.
+ */
+function loadAccessKey(file) {
+  try {
+    const key = readFileSync(file, 'utf8').trim();
+    if (key.length >= MIN_KEY_LENGTH) return key;
+  } catch {}
+  const key = random(24);
+  try {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    writeFileSync(file, `${key}\n`, { mode: 0o600 });
+  } catch {} // an unwritable state dir means a new key every start
+  return key;
 }
 
 export function defaultStateFile(env = process.env) {
@@ -110,12 +144,18 @@ h1{font-size:22px;line-height:1.25;margin:0 0 12px}p{margin:0 0 16px}.mut{color:
 .btn{display:block;width:100%;padding:12px 16px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--fg);font:inherit;font-weight:600;text-align:center;text-decoration:none;cursor:pointer;margin:0 0 10px}
 .btn.primary{background:var(--acc);border-color:var(--acc);color:#fff}@media(prefers-color-scheme:dark){.btn.primary{color:#0b1a2e}}
 .btn:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
-#status{min-height:21px;margin:16px 0 0}#status.err{color:var(--err)}code{font-size:13px}
+#status{min-height:21px;margin:16px 0 0}#status.err,.err{color:var(--err)}code{font-size:13px;overflow-wrap:anywhere}
+ol.steps{margin:0 0 16px;padding:0 0 0 22px}ol.steps li{margin:0 0 16px;padding-left:4px}ol.steps p{margin:0 0 10px}
+label{display:block;font-weight:600;margin:0 0 6px}
+textarea,input[type=password]{display:block;width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--fg);font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0 0 10px;resize:vertical}
+textarea:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+details{margin:0 0 10px}summary{cursor:pointer;font-weight:600;padding:12px 16px;border:1px solid var(--line);border-radius:10px;text-align:center;list-style:none}summary::-webkit-details-marker{display:none}details[open] summary{margin-bottom:16px}
 </style></head><body><main>${body}</main>${script}</body></html>`;
 }
 
 export async function createHttpApp({
   bin, context, sandbox = false, port = 8377, host = '127.0.0.1', stateFile = defaultStateFile(),
+  publicUrl, allowedHosts = [], headless = isHeadless(), accessKey,
 } = {}) {
   const cli = createCli({ bin, context });
   const login = createLoginManager(cli);
@@ -123,6 +163,36 @@ export async function createHttpApp({
   const requests = new Map(); // authorization requests waiting on the user
   const codes = new Map();
   let boundPort = port;
+
+  // Every URL handed to a client is built from the public base when there is
+  // one; the bind address means nothing to a client on another machine.
+  const publicBase = publicUrl ? normalizeBase(publicUrl) : null;
+  const publicOrigin = publicBase ? new URL(publicBase) : null;
+  const prefix = publicOrigin ? publicOrigin.pathname.replace(/\/+$/, '') : '';
+  const hostRules = allowedHosts.map((h) => {
+    const rule = parseHostRule(h);
+    if (!rule) throw new Error(`Invalid entry in the allowed hosts: "${h}". Use a host name, optionally with a port.`);
+    return rule;
+  });
+  if (publicOrigin) {
+    hostRules.push({ name: publicOrigin.hostname.toLowerCase(), port: publicOrigin.port || (publicOrigin.protocol === 'https:' ? '443' : '80') });
+  }
+  const ruleAllows = (name, portValue) => hostRules.some((r) =>
+    r.name === name && (r.port === null || r.port === portValue || (portValue === null && ['80', '443'].includes(r.port))));
+
+  // Reachable from other machines: the browser is elsewhere, so the sign-in
+  // is relayed by hand, and the sign-in page is no longer private to the
+  // person at this computer, so it asks for the access key first.
+  const remote = !['127.0.0.1', 'localhost', '::1'].includes(host)
+    || allowedHosts.length > 0
+    || (publicOrigin !== null && !LOOPBACK.has(publicOrigin.hostname));
+  const relay = headless || remote;
+  if (accessKey !== undefined && String(accessKey).length < MIN_KEY_LENGTH) {
+    throw new Error(`The access key must be at least ${MIN_KEY_LENGTH} characters long.`);
+  }
+  const keyFile = join(dirname(stateFile), 'access-key');
+  const key = remote ? String(accessKey ?? loadAccessKey(keyFile)) : null;
+  const keyFailures = [];
 
   let authCache = null;
   /** Identity of the CLI's (pinned or active) context, or null when signed out. */
@@ -204,7 +274,8 @@ export async function createHttpApp({
 
   /** The user is signed in and agreed: hand the client its authorization code. */
   function complete(rid, request) {
-    requests.delete(rid);
+    // The page's poll and its paste form can both get here; they must agree.
+    if (request.redirect) return request.redirect;
     const code = random();
     codes.set(code, {
       client_id: request.client_id,
@@ -212,7 +283,15 @@ export async function createHttpApp({
       code_challenge: request.code_challenge,
       exp: now() + CODE_TTL,
     });
-    return clientRedirect(request, { code });
+    request.redirect = clientRedirect(request, { code });
+    request.exp = now() + CODE_TTL;
+    return request.redirect;
+  }
+
+  function keyMatches(candidate) {
+    const a = createHash('sha256').update(String(candidate ?? '')).digest();
+    const b = createHash('sha256').update(key).digest();
+    return timingSafeEqual(a, b);
   }
 
   // --- OAuth endpoints ---
@@ -258,7 +337,10 @@ export async function createHttpApp({
     if (!redirectUri || !validRedirect(redirectUri) || !client.redirect_uris.some((r) => redirectMatches(r, redirectUri))) {
       return errorPage(res, 400, 'The redirect address sent by the MCP client does not match its registration.');
     }
-    const request = { client_id: client.client_id, redirect_uri: redirectUri, state: q.state, code_challenge: q.code_challenge, exp: now() + REQUEST_TTL, session: null };
+    const request = {
+      client_id: client.client_id, client_name: client.client_name, redirect_uri: redirectUri, state: q.state,
+      code_challenge: q.code_challenge, exp: now() + REQUEST_TTL, session: null, redirect: null, unlocked: key === null,
+    };
     const reject = (error, description) => {
       res.writeHead(302, { Location: clientRedirect(request, { error, error_description: description }), 'Cache-Control': 'no-store' });
       res.end();
@@ -269,38 +351,113 @@ export async function createHttpApp({
     prune();
     const rid = random();
     requests.set(rid, request);
+    return request.unlocked ? signInPage(res, rid, request) : keyPage(res, rid, request);
+  }
+
+  const environment = sandbox ? 'DNSimple Sandbox' : 'DNSimple';
+  const cancelForm = (rid) => `<form method="post" action="${prefix}/authorize/deny"><input type="hidden" name="rid" value="${rid}"><button class="btn" type="submit">Cancel</button></form>`;
+
+  /** Asked before anything else when the page can be reached from other machines. */
+  function keyPage(res, rid, request, error) {
+    const body = `
+<h1>Connect ${esc(request.client_name)} to ${environment}</h1>
+<p>This server can be reached from other computers, so it asks for its access key before it lets anyone connect to the DNSimple account.</p>
+<form method="post" action="${prefix}/authorize/unlock"><input type="hidden" name="rid" value="${rid}">
+<label for="key">Access key</label>
+<input id="key" name="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required autofocus${error ? ' aria-describedby="keyerr" aria-invalid="true"' : ''}>
+${error ? `<p id="keyerr" class="err" role="alert">${esc(error)}</p>` : ''}
+<button class="btn primary" type="submit">Continue</button></form>
+${cancelForm(rid)}
+<p class="mut">The key is printed in the server's log when it starts, and is the value of <code>DNSIMPLE_MCP_ACCESS_KEY</code> if that is set.</p>`;
+    send(res, error ? 403 : 200, page({ title: `Connect to ${environment}`, body }));
+  }
+
+  async function unlock(req, res) {
+    let p;
+    try { p = await readParams(req); } catch { return errorPage(res, 400, 'Bad request.'); }
+    const request = takeRequest(p.rid);
+    if (!request) return errorPage(res, 400, 'This request expired.');
+    if (request.unlocked) return signInPage(res, p.rid, request);
+    while (keyFailures.length && keyFailures[0] <= Date.now() - 60_000) keyFailures.shift();
+    if (keyFailures.length >= MAX_KEY_FAILURES) {
+      return send(res, 429, page({ title: 'DNSimple MCP', body: '<h1>Too many attempts</h1><p>Wait a minute, then start the connection again from your MCP client.</p>' }), { 'Retry-After': '60' });
+    }
+    if (!keyMatches(p.key)) {
+      keyFailures.push(Date.now());
+      return keyPage(res, p.rid, request, 'That is not the access key of this server.');
+    }
+    request.unlocked = true;
+    return signInPage(res, p.rid, request);
+  }
+
+  async function signInPage(res, rid, request) {
+    const name = esc(request.client_name);
     const identity = await cliIdentity({ fresh: true });
-    const environment = sandbox ? 'DNSimple Sandbox' : 'DNSimple';
     const who = identity && identity.account_id !== undefined
       ? `account <strong>${esc(identity.account_id)}</strong>${identity.context ? ` (context <code>${esc(identity.context)}</code>)` : ''}`
       : 'the account stored in the dnsimple CLI';
-    const signIn = `<a class="btn${identity ? '' : ' primary'}" id="signin" target="_blank" rel="noopener" href="/authorize/dnsimple?rid=${rid}">${identity ? 'Use a different account' : `Sign in with ${environment}`}</a>`;
+    const place = relay ? 'This server' : 'This computer';
+    const signInLabel = identity ? 'Use a different account' : `Sign in with ${environment}`;
+    const signIn = (cls) => `<a class="btn${cls}" id="signin" target="_blank" rel="noopener" href="${prefix}/authorize/dnsimple?rid=${rid}">${relay && identity ? `Sign in with ${environment}` : signInLabel}</a>`;
+    // The browser is on another machine: the CLI's loopback callback cannot
+    // reach it, so the user carries the address back by hand.
+    const steps = `
+<ol class="steps">
+<li><p><strong>Sign in.</strong> Open ${environment} in a new tab and approve the request.</p>${signIn(identity ? '' : ' primary')}</li>
+<li><p><strong>Bring the address back.</strong> After you approve, that tab shows a “can’t connect” error at an address starting with <code>http://127.0.0.1</code>. That is expected: the server runs on another machine. Copy the whole address from the address bar and paste it here.</p>
+<form id="finish"><label for="redirect_url">Address from the other tab</label>
+<textarea id="redirect_url" name="redirect_url" rows="3" placeholder="http://127.0.0.1:…/callback?code=…&amp;state=…" autocomplete="off" autocapitalize="off" spellcheck="false" required></textarea>
+<button class="btn" type="submit">Finish sign-in</button></form></li>
+</ol>`;
     const body = `
-<h1>Connect ${esc(client.client_name)} to ${environment}</h1>
+<h1>Connect ${name} to ${environment}</h1>
 <p>${identity
-    ? `This computer is signed in to ${environment} as ${who}. ${esc(client.client_name)} will be able to read and change everything in that account.`
-    : `${esc(client.client_name)} will be able to read and change everything in the account you sign in to. The sign-in opens in a new tab and is handled by the dnsimple CLI on this computer.`}</p>
-${identity ? `<form method="post" action="/authorize/approve"><input type="hidden" name="rid" value="${rid}"><button class="btn primary" type="submit">Continue</button></form>` : ''}
-${signIn}
-<form method="post" action="/authorize/deny"><input type="hidden" name="rid" value="${rid}"><button class="btn" type="submit">Cancel</button></form>
+    ? `${place} is signed in to ${environment} as ${who}. ${name} will be able to read and change everything in that account.`
+    : `${name} will be able to read and change everything in the account you sign in to.${relay ? '' : ' The sign-in opens in a new tab and is handled by the dnsimple CLI on this computer.'}`}</p>
+${identity ? `<form method="post" action="${prefix}/authorize/approve"><input type="hidden" name="rid" value="${rid}"><button class="btn primary" type="submit">Continue</button></form>` : ''}
+${relay ? (identity ? `<details><summary>Use a different account</summary>${steps}</details>` : steps) : signIn(identity ? '' : ' primary')}
+${cancelForm(rid)}
 <p id="status" class="mut" role="status" aria-live="polite"></p>`;
     const script = `<script>
 (() => {
   const status = document.getElementById('status');
   let timer = null;
+  let done = false;
   const say = (text, err) => { status.textContent = text; status.className = err ? 'err' : 'mut'; };
+  const leave = (to) => { done = true; say('Signed in. Returning to your MCP client…'); location.replace(to); };
   async function poll() {
+    if (done) return;
     try {
-      const r = await (await fetch('/authorize/poll?rid=${rid}', { cache: 'no-store' })).json();
-      if (r.status === 'done') { say('Signed in. Returning to your MCP client…'); location.replace(r.redirect); return; }
+      const r = await (await fetch('${prefix}/authorize/poll?rid=${rid}', { cache: 'no-store' })).json();
+      if (done) return;
+      if (r.status === 'done') return leave(r.redirect);
       if (r.status === 'failed') { say(r.error || 'The sign-in did not complete. Try again.', true); timer = null; return; }
       if (r.status === 'expired') { say('This request expired. Start the connection again from your MCP client.', true); timer = null; return; }
     } catch {}
     timer = setTimeout(poll, 1000);
   }
   document.getElementById('signin').addEventListener('click', () => {
-    say('Waiting for you to approve in the DNSimple tab…');
+    say(${relay ? "'Approve in the DNSimple tab, then paste the address it ends on.'" : "'Waiting for you to approve in the DNSimple tab…'"});
     if (!timer) timer = setTimeout(poll, 1500);
+  });
+  const finish = document.getElementById('finish');
+  if (finish) finish.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const button = finish.querySelector('button');
+    button.disabled = true;
+    say('Finishing the sign-in…');
+    try {
+      const r = await (await fetch('${prefix}/authorize/complete', {
+        method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rid: '${rid}', redirect_url: finish.elements.redirect_url.value }),
+      })).json();
+      if (done) return;
+      if (r.status === 'done') return leave(r.redirect);
+      say(r.error || 'The sign-in did not complete. Try again.', true);
+    } catch {
+      say('Could not reach the server. Try again.', true);
+    }
+    button.disabled = false;
   });
 })();
 </script>`;
@@ -310,10 +467,11 @@ ${signIn}
   /** Start `dnsimple auth login` and send this tab to the consent page it produced. */
   async function startDnsimple(url, res) {
     const request = takeRequest(url.searchParams.get('rid'));
-    if (!request) return errorPage(res, 400, 'This request expired.');
+    if (!request?.unlocked) return errorPage(res, 400, 'This request expired.');
     let session;
     try {
-      session = login.start({ sandbox, noBrowser: true });
+      await cli.ensure();
+      session = login.start({ sandbox, noBrowser: true, headless: relay });
       request.session = session;
       await login.waitForUrl(session);
     } catch (error) {
@@ -329,7 +487,8 @@ ${signIn}
   function poll(url, res) {
     const rid = url.searchParams.get('rid');
     const request = takeRequest(rid);
-    if (!request) return send(res, 200, { status: 'expired' });
+    if (!request?.unlocked) return send(res, 200, { status: 'expired' });
+    if (request.redirect) return send(res, 200, { status: 'done', redirect: request.redirect });
     const s = request.session;
     if (!s) return send(res, 200, { status: 'idle' });
     if (s.state === 'pending') return send(res, 200, { status: 'pending' });
@@ -350,13 +509,34 @@ ${signIn}
     if (!approve) {
       requests.delete(rid);
       location = clientRedirect(request, { error: 'access_denied', error_description: 'The user cancelled.' });
+    } else if (!request.unlocked) {
+      return errorPage(res, 403, 'Enter the access key of this server first.');
     } else if (await cliIdentity({ fresh: true })) {
       location = complete(rid, request);
+      requests.delete(rid);
     } else {
       return errorPage(res, 409, 'The dnsimple CLI is no longer signed in.');
     }
     res.writeHead(303, { Location: location, 'Cache-Control': 'no-store' });
     res.end();
+  }
+
+  /** The pasted loopback address: let the CLI on this machine finish its own login. */
+  async function finishSignIn(req, res) {
+    let p;
+    try { p = await readParams(req); } catch { return send(res, 400, { status: 'error', error: 'Bad request.' }); }
+    const request = takeRequest(p.rid);
+    if (!request?.unlocked) return send(res, 200, { status: 'error', error: 'This request expired. Start the connection again from your MCP client.' });
+    if (request.redirect) return send(res, 200, { status: 'done', redirect: request.redirect });
+    if (!request.session) return send(res, 200, { status: 'error', error: 'Do step 1 first: open the DNSimple sign-in, approve, then paste the address that tab ends on.' });
+    try {
+      await login.complete(p.redirect_url, request.session);
+    } catch (error) {
+      if (error.restart) request.session = null;
+      return send(res, 200, { status: 'error', error: error.message.replace(/[.\s]*$/, '.') + (error.restart ? ' Do step 1 again to get a new sign-in.' : '') });
+    }
+    authCache = null;
+    send(res, 200, { status: 'done', redirect: complete(p.rid, request) });
   }
 
   async function token(req, res) {
@@ -429,29 +609,40 @@ ${signIn}
   const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, MCP-Protocol-Version', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' };
 
   async function handle(req, res) {
-    // DNS-rebinding guard: only answer to names that mean "this machine".
-    const hostHeader = req.headers.host || '';
-    const name = hostHeader.replace(/:\d+$/, '');
-    if (!LOOPBACK.has(name) || (hostHeader.match(/:(\d+)$/)?.[1] ?? '80') !== String(boundPort)) {
-      return send(res, 403, { error: 'forbidden', error_description: 'Unexpected Host header.' });
+    // DNS-rebinding guard: only answer to names that mean "this machine", plus
+    // the names this server was told it is published under.
+    const hostHeader = (req.headers.host || '').toLowerCase();
+    const [, name = '', hostPort = null] = /^(.*?)(?::(\d+))?$/.exec(hostHeader) ?? [];
+    const local = LOOPBACK.has(name) && (hostPort ?? '80') === String(boundPort);
+    if (!local && !ruleAllows(name, hostPort)) {
+      return send(res, 403, {
+        error: 'forbidden',
+        error_description: 'Unexpected Host header. Start the server with --public-url <url> or --allowed-hosts <host> to serve it under this name.',
+      });
     }
-    const base = `http://${hostHeader}`;
-    const url = new URL(req.url, base);
-    const path = url.pathname.replace(/\/+$/, '') || '/';
+    const requestOrigin = `http://${hostHeader}`;
+    const base = publicBase ?? requestOrigin;
+    const url = new URL(req.url, requestOrigin);
+    let path = url.pathname;
+    // A proxy may or may not strip the public URL's path before forwarding.
+    if (prefix && (path === prefix || path.startsWith(`${prefix}/`))) path = path.slice(prefix.length);
+    path = path.replace(/\/+$/, '') || '/';
     const origin = req.headers.origin;
     const route = `${req.method} ${path}`;
 
     // Discovery, registration and the token endpoint carry no ambient
     // credentials, so any origin may call them (browser-based MCP clients do).
-    const open = ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp', '/.well-known/oauth-authorization-server', '/register', '/token', '/revoke'];
+    const open = ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp', '/.well-known/oauth-authorization-server', '/.well-known/openid-configuration', '/register', '/token', '/revoke'];
     if (open.includes(path)) {
       for (const [k, v] of Object.entries(CORS)) res.setHeader(k, v);
       if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
     } else if (origin && origin !== 'null') {
-      // Everything else acts for the user: same-origin pages and loopback web clients only.
+      // Everything else acts for the user: the server's own pages, and for
+      // /mcp also loopback web clients and the hosts it is published under.
       const o = parseUrl(origin);
-      const sameOrigin = origin === base;
-      if (path === '/mcp' ? !(o && isLoopbackUrl(o)) : !sameOrigin) {
+      const sameOrigin = origin === requestOrigin || origin === publicOrigin?.origin;
+      const known = o && (isLoopbackUrl(o) || ruleAllows(o.hostname.toLowerCase(), o.port || null));
+      if (path === '/mcp' ? !(sameOrigin || known) : !sameOrigin) {
         return send(res, 403, { error: 'forbidden', error_description: 'Unexpected Origin.' });
       }
       if (path === '/mcp') {
@@ -468,11 +659,14 @@ ${signIn}
       case 'GET /.well-known/oauth-protected-resource/mcp':
         return send(res, 200, { resource: `${base}/mcp`, authorization_servers: [base], bearer_methods_supported: ['header'], resource_name: 'DNSimple MCP' });
       case 'GET /.well-known/oauth-authorization-server':
+      case 'GET /.well-known/openid-configuration': // where clients look when the public URL has a path
         return send(res, 200, metadata(base));
       case 'POST /register': return register(req, res);
       case 'GET /authorize': return authorize(url, res);
       case 'GET /authorize/dnsimple': return startDnsimple(url, res);
       case 'GET /authorize/poll': return poll(url, res);
+      case 'POST /authorize/unlock': return unlock(req, res);
+      case 'POST /authorize/complete': return finishSignIn(req, res);
       case 'POST /authorize/approve': return decide(req, res, true);
       case 'POST /authorize/deny': return decide(req, res, false);
       case 'POST /token': return token(req, res);
@@ -494,11 +688,18 @@ ${signIn}
 
   return {
     server,
+    cli,
+    /** Set when the sign-in page asks for a key; `accessKeyFile` when this server generated it. */
+    accessKey: key,
+    accessKeyFile: key !== null && accessKey === undefined ? keyFile : null,
+    relay,
+    /** Resolves to the base URL clients should use. */
     listen: () => new Promise((resolve, reject) => {
       server.once('error', reject);
       server.listen(port, host, () => {
         boundPort = server.address().port;
-        resolve(`http://${host}:${boundPort}`);
+        const local = ['0.0.0.0', '::'].includes(host) ? '127.0.0.1' : host.includes(':') ? `[${host}]` : host;
+        resolve(publicBase ?? `http://${local}:${boundPort}`);
       });
     }),
     close() {

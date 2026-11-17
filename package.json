@@ -1,6 +1,6 @@
 {
   "name": "dnsimple-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for DNSimple that wraps the official dnsimple CLI and asks for OAuth on the MCP connection, signing in through the CLI's browser flow — no API tokens.",
   "type": "module",
   "bin": {
@@ -14,7 +14,8 @@
   ],
   "scripts": {
     "start": "node bin/dnsimple-mcp.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:docker": "node --test test/docker/*.test.js"
   },
   "engines": {
     "node": ">=20"

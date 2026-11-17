@@ -16,7 +16,7 @@ const cliState = join(dir, 'cli-credential');
 process.env.FAKE_STATE = cliState; // the fake CLI is signed out until this file exists
 const stateFile = join(dir, 'http.json');
 
-let app = await createHttpApp({ bin: FAKE, port: 0, stateFile });
+let app = await createHttpApp({ bin: FAKE, port: 0, stateFile, headless: false });
 let base = await app.listen();
 after(async () => { await app.close(); rmSync(dir, { recursive: true, force: true }); });
 
@@ -179,7 +179,7 @@ test('the endpoint refuses foreign Host and Origin headers, and tokens are store
 
 test('refresh rotates, and registrations and tokens survive a restart', async () => {
   await app.close();
-  app = await createHttpApp({ bin: FAKE, port: 0, stateFile });
+  app = await createHttpApp({ bin: FAKE, port: 0, stateFile, headless: false });
   base = await app.listen();
   assert.equal((await rpc(tokens.access_token)).status, 200);
 

@@ -10,7 +10,7 @@ after(() => s.close());
 test('exposes the tool set with safety annotations', async () => {
   const { tools } = await s.client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [
-    'dnsimple_auth_login', 'dnsimple_auth_logout', 'dnsimple_auth_status', 'dnsimple_auth_switch',
+    'dnsimple_auth_complete', 'dnsimple_auth_login', 'dnsimple_auth_logout', 'dnsimple_auth_status', 'dnsimple_auth_switch',
     'dnsimple_guide', 'dnsimple_mutate', 'dnsimple_query',
   ]);
   const by = Object.fromEntries(tools.map((t) => [t.name, t]));
@@ -103,7 +103,7 @@ test('unauthenticated errors point at the OAuth login', async () => {
   try {
     const r = await u.call('dnsimple_query', { command: 'zones list' });
     assert.equal(r.isError, true);
-    assert.match(r.text, /^not authenticated[\s\S]*Call dnsimple_auth_login/);
+    assert.match(r.text, /^not authenticated[\s\S]*Not signed in to DNSimple\. Call dnsimple_auth_login/);
     assert.equal((await u.call('dnsimple_auth_status')).json.authenticated, false);
   } finally { await u.close(); }
 });
@@ -123,5 +123,9 @@ test('a missing CLI is reported, not fatal', async () => {
     const r = await m.call('dnsimple_query', { command: 'zones list' });
     assert.equal(r.isError, true);
     assert.match(r.text, /dnsimple CLI was not found/);
+    // Also said once on stderr at startup, never on stdout (that is the protocol channel).
+    for (let i = 0; i < 50 && !m.stderr(); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.match(m.stderr(), /dnsimple-mcp: The dnsimple CLI was not found/);
+    assert.equal((await m.client.listTools()).tools.length, 8);
   } finally { await m.close(); }
 });

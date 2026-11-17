@@ -10,7 +10,45 @@ import { join, delimiter } from 'node:path';
 // process never reads it.
 
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
+// A headless login waits on a person relaying an address by hand; keep the
+// loopback listener (and the pasted code's window) short.
+const HEADLESS_TIMEOUT_MS = 5 * 60_000;
+const REPLAY_TIMEOUT_MS = 30_000;
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 const AUTHORIZE_URL = /https:\/\/[^\s"']+\/oauth\/authorize\?[^\s"']+/;
+
+/** A problem the user can fix; `restart` means the pending login is gone. */
+export class LoginError extends Error {
+  constructor(message, { restart = false } = {}) {
+    super(message);
+    this.restart = restart;
+  }
+}
+
+/**
+ * True when no browser can be opened next to this process: forced with
+ * DNSIMPLE_MCP_HEADLESS=1 (0 forces it off), inside a container, or on Linux
+ * without a display server.
+ */
+export function isHeadless(env = process.env) {
+  const flag = env.DNSIMPLE_MCP_HEADLESS;
+  if (flag !== undefined && flag !== '') return !/^(0|false|no|off)$/i.test(flag);
+  if (env.container || existsSync('/.dockerenv') || existsSync('/run/.containerenv')) return true;
+  return process.platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY;
+}
+
+/** The CLI's loopback listener, read off the authorize URL it produced. */
+export function callbackOf(authorizeUrl) {
+  try {
+    const authorize = new URL(authorizeUrl);
+    const redirect = new URL(authorize.searchParams.get('redirect_uri'));
+    const state = authorize.searchParams.get('state');
+    if (redirect.protocol !== 'http:' || !LOOPBACK_HOSTS.has(redirect.hostname) || !redirect.port || !state) return null;
+    return { hostname: redirect.hostname, port: redirect.port, path: redirect.pathname, state };
+  } catch {
+    return null;
+  }
+}
 
 function which(name, pathVar) {
   for (const dir of (pathVar || '').split(delimiter)) {
@@ -54,7 +92,7 @@ function ptyCommand(bin, args) {
     : ['script', ['-q', '/dev/null', bin, ...args]];
 }
 
-export function createLoginManager(cli) {
+export function createLoginManager(cli, { ttlMs = Number(process.env.DNSIMPLE_MCP_LOGIN_TTL) * 1000 || undefined } = {}) {
   let session = null;
 
   function cleanup(s) {
@@ -68,7 +106,12 @@ export function createLoginManager(cli) {
     try { process.kill(-s.child.pid, 'SIGTERM'); } catch { try { s.child.kill('SIGTERM'); } catch {} }
   }
 
-  function start({ sandbox = false, name, noBrowser = false } = {}) {
+  /**
+   * `noBrowser` leaves opening the authorize URL to the caller. `headless`
+   * says the browser is on another machine, so the login is finished with
+   * complete() and expires sooner.
+   */
+  function start({ sandbox = false, name, noBrowser = false, headless = false } = {}) {
     if (session?.state === 'pending') return session;
 
     const args = ['auth', 'login'];
@@ -101,7 +144,11 @@ export function createLoginManager(cli) {
       detached: true,
     });
 
-    const s = { state: 'pending', child, dir, urlFile, url: null, output: '', error: null, sandbox, startedAt: Date.now() };
+    const lifetime = ttlMs ?? (headless ? HEADLESS_TIMEOUT_MS : LOGIN_TIMEOUT_MS);
+    const s = {
+      state: 'pending', child, dir, urlFile, url: null, output: '', error: null, sandbox, headless,
+      startedAt: Date.now(), expiresAt: Date.now() + lifetime, expired: false, replaying: null,
+    };
     session = s;
 
     const onData = (chunk) => {
@@ -124,12 +171,15 @@ export function createLoginManager(cli) {
       child.on('error', (e) => finish('failed', e.message));
       child.on('exit', (code, signal) => {
         if (code === 0) return finish('succeeded');
-        const text = s.output.replace(/[\x00-\x08\x0b-\x1f]/g, '').trim().split('\n').at(-1) || '';
+        // The CLI's own "Error: …" line; what follows it is a hint to use an API token.
+        const lines = s.output.replace(/[\x00-\x08\x0b-\x1f]/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
+        const text = lines.findLast((l) => l.startsWith('Error: '))?.slice(7) || lines.at(-1) || '';
+        if (s.expired) return finish('cancelled', `The sign-in was not completed within ${Math.round(lifetime / 60_000) || 1} minute(s) and expired.`);
         finish(signal ? 'cancelled' : 'failed', signal ? `Login ended (${signal}).` : text || `Login exited with code ${code}.`);
       });
     });
 
-    s.timer = setTimeout(() => kill(s), LOGIN_TIMEOUT_MS);
+    s.timer = setTimeout(() => { s.expired = true; kill(s); }, lifetime);
     s.timer.unref();
     return s;
   }
@@ -155,10 +205,61 @@ export function createLoginManager(cli) {
     return Promise.race([s.done, timeout]).finally(() => clearTimeout(t)).then(() => s);
   }
 
+  /**
+   * Finish a login whose browser ran on another machine. `redirectUrl` is the
+   * address that browser ended on: the CLI's loopback callback, unreachable
+   * from there. It is replayed to the CLI's listener here, so the CLI does its
+   * own code exchange and stores the credential itself.
+   */
+  async function complete(redirectUrl, expected = session) {
+    const s = session;
+    if (!s || s !== expected) throw new LoginError('No sign-in is in progress.', { restart: true });
+    if (s.state === 'succeeded') return s;
+    if (s.state !== 'pending') {
+      throw new LoginError(s.expired ? s.error : `That sign-in already ended: ${s.error || s.state}`, { restart: true });
+    }
+    const cb = readUrl(s) && callbackOf(s.url);
+    if (!cb) throw new LoginError('The dnsimple CLI did not announce a loopback callback, so this sign-in cannot be finished by pasting an address.');
+    const expectedPrefix = `http://${cb.hostname}:${cb.port}${cb.path}`;
+
+    let url;
+    try { url = new URL(String(redirectUrl ?? '').trim()); } catch {
+      throw new LoginError(`That is not a complete address. Copy the whole address from the browser's address bar after approving; it starts with ${expectedPrefix}?`);
+    }
+    // Checked here, before the CLI sees anything: the CLI aborts the whole
+    // login on a callback it does not like.
+    if (url.protocol !== 'http:' || !LOOPBACK_HOSTS.has(url.hostname)) {
+      throw new LoginError(`That address does not point at this sign-in. After approving on dnsimple.com the browser ends on an address starting with ${expectedPrefix}? — copy that one.`);
+    }
+    if (url.port !== cb.port || url.pathname !== cb.path) {
+      throw new LoginError(`That address belongs to a different sign-in attempt (expected one starting with ${expectedPrefix}?). Open the current sign-in link again and copy the address you land on.`);
+    }
+    if (url.searchParams.get('state') !== cb.state) {
+      throw new LoginError('The `state` in that address does not match the sign-in in progress. It is probably from an earlier attempt: open the current sign-in link again and copy the address you land on.');
+    }
+    if (!url.searchParams.has('code') && !url.searchParams.has('error')) {
+      throw new LoginError('That address has no authorization `code`. Copy the whole address, including everything after the "?".');
+    }
+
+    s.replaying ??= fetch(`${expectedPrefix}${url.search}`, { redirect: 'manual', signal: AbortSignal.timeout(REPLAY_TIMEOUT_MS) })
+      .then((res) => res.arrayBuffer())
+      .catch(() => {}); // the CLI may exit before the response is complete
+    await s.replaying;
+    await waitForCompletion(s, REPLAY_TIMEOUT_MS);
+
+    if (s.state === 'succeeded') return s;
+    if (s.state === 'pending') {
+      s.replaying = null;
+      throw new LoginError('The dnsimple CLI received the address but has not finished signing in yet. Check the status in a moment.');
+    }
+    throw new LoginError(`DNSimple did not accept the sign-in: ${s.error || s.state}`, { restart: true });
+  }
+
   return {
     start,
     waitForUrl,
     waitForCompletion,
+    complete,
     current: () => session,
     cancel: () => kill(session),
   };

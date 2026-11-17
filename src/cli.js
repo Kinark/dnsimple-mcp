@@ -46,6 +46,12 @@ export function createCli({ bin = process.env.DNSIMPLE_BIN || 'dnsimple', contex
             { code: 'ENOENT' },
           ));
         }
+        if (error.code === 'EACCES') {
+          return reject(new CliError(
+            `The dnsimple CLI at "${bin}" is not executable. Fix its permissions or set DNSIMPLE_BIN.`,
+            { code: 'ENOENT' },
+          ));
+        }
         const text = (stderr || stdout || error.message).trim().replace(/^Error: /, '');
         reject(new CliError(error.killed ? `Timed out after ${timeout / 1000}s: ${text}` : text, { code: error.code, stderr }));
       });
@@ -56,7 +62,7 @@ export function createCli({ bin = process.env.DNSIMPLE_BIN || 'dnsimple', contex
 
   /** Parsed command catalog; an empty one means "CLI changed format, don't validate". */
   function catalog() {
-    catalogPromise ??= exec(['ai', '--full'])
+    catalogPromise ??= exec(['ai', '--full'], { timeout: 20_000 })
       .then(({ stdout }) => parseCatalog(stdout))
       .catch((error) => {
         catalogPromise = undefined; // retry next time (e.g. CLI installed later)
@@ -133,5 +139,10 @@ export function createCli({ bin = process.env.DNSIMPLE_BIN || 'dnsimple', contex
     try { return JSON.parse(text); } catch { return text; }
   }
 
-  return { bin, env, context, exec, catalog, buildArgs, run, contextArgs };
+  /** Rejects with the "not found" explanation when the binary cannot be run at all. */
+  const ensure = () => exec(['--version'], { timeout: 20_000 }).then(() => {}, (error) => {
+    if (error.code === 'ENOENT') throw error;
+  });
+
+  return { bin, env, context, exec, ensure, catalog, buildArgs, run, contextArgs };
 }

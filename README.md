@@ -17,7 +17,7 @@ An [MCP](https://modelcontextprotocol.io) server for [DNSimple](https://dnsimple
 Claude Code:
 
 ```sh
-claude mcp add dnsimple -- npx -y github:Kinark/dnsimple-mcp
+claude mcp add dnsimple -- npx -y --allow-git=all github:Kinark/dnsimple-mcp
 ```
 
 Any other MCP client (stdio):
@@ -27,10 +27,17 @@ Any other MCP client (stdio):
   "mcpServers": {
     "dnsimple": {
       "command": "npx",
-      "args": ["-y", "github:Kinark/dnsimple-mcp"]
+      "args": ["-y", "--allow-git=all", "github:Kinark/dnsimple-mcp"]
     }
   }
 }
+```
+
+`--allow-git=all` is needed on npm 12+, which refuses packages from git by default. Or run it from a clone:
+
+```sh
+git clone https://github.com/Kinark/dnsimple-mcp && cd dnsimple-mcp && npm install
+claude mcp add dnsimple -- node "$PWD/bin/dnsimple-mcp.js"
 ```
 
 If you are already signed in with the CLI, it works immediately. Otherwise ask the assistant to sign in to DNSimple and approve the request in the browser.

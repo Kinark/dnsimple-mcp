@@ -30,8 +30,8 @@ test('the image runs as a non-root user with the pinned CLI and /data as its hom
   assert.equal(writable, 'writable');
 });
 
-test('docker run -i: initialize and tools/list answer at once, and sign-in is the two-step headless one', async () => {
-  const transport = new StdioClientTransport({ command: 'docker', args: ['run', '-i', '--rm', '-v', `${volume}:/data`, image], stderr: 'pipe' });
+test('docker run -i --stdio: initialize and tools/list answer at once, and sign-in is the two-step headless one', async () => {
+  const transport = new StdioClientTransport({ command: 'docker', args: ['run', '-i', '--rm', '-v', `${volume}:/data`, image, '--stdio'], stderr: 'pipe' });
   const client = new Client({ name: 'smoke', version: '0' });
   const started = Date.now();
   await client.connect(transport);
@@ -71,12 +71,12 @@ const freePort = () => new Promise((resolve) => {
   s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); });
 });
 
-test('--http serves the OAuth-protected endpoint under the published address', async () => {
+test('default (http) serves the OAuth-protected endpoint under the published address', async () => {
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
   const name = `${volume}-http`;
   // Detached, stdin closed: HTTP mode must not need it.
-  docker('run', '-d', '--name', name, '-p', `127.0.0.1:${port}:8377`, '-v', `${volume}:/data`, '-e', `DNSIMPLE_MCP_PUBLIC_URL=${base}`, image, '--http');
+  docker('run', '-d', '--name', name, '-p', `127.0.0.1:${port}:8377`, '-v', `${volume}:/data`, '-e', `DNSIMPLE_MCP_PUBLIC_URL=${base}`, image);
   // The server logs to stderr.
   const logs = () => { const r = spawnSync('docker', ['logs', name], { encoding: 'utf8' }); return r.stdout + r.stderr; };
   try {
@@ -98,7 +98,7 @@ test('--http serves the OAuth-protected endpoint under the published address', a
 });
 
 test('a signal stops the stdio container promptly', async () => {
-  const child = spawn('docker', ['run', '-i', '--rm', image], { stdio: ['pipe', 'ignore', 'ignore'] });
+  const child = spawn('docker', ['run', '-i', '--rm', image, '--stdio'], { stdio: ['pipe', 'ignore', 'ignore'] });
   await new Promise((r) => setTimeout(r, 1500));
   const started = Date.now();
   child.stdin.end(); // the host went away

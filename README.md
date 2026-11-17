@@ -72,29 +72,26 @@ node bin/dnsimple-mcp.js --http
 
 `ghcr.io/kinark/dnsimple-mcp` (linux/amd64 and linux/arm64) contains Node, a pinned `dnsimple` CLI and this server. Nothing else is needed on the host. It runs as a non-root user, and the `/data` volume holds everything that must survive a restart: the CLI's credential store and this server's state. Keep the volume and a restarted container is still signed in.
 
-stdio, as the command of an MCP server:
+The image is an HTTP server, so the MCP connection itself asks for OAuth:
 
 ```sh
-docker run -i --rm -v dnsimple-mcp:/data ghcr.io/kinark/dnsimple-mcp
+docker run -d --name dnsimple-mcp --restart unless-stopped \
+  -p 8377:8377 -v dnsimple-mcp:/data ghcr.io/kinark/dnsimple-mcp
+docker logs dnsimple-mcp        # shows the access key the sign-in page asks for
+claude mcp add --transport http dnsimple http://127.0.0.1:8377/mcp
 ```
 
 ```json
 {
   "mcpServers": {
-    "dnsimple": {
-      "command": "docker",
-      "args": ["run", "-i", "--rm", "-v", "dnsimple-mcp:/data", "ghcr.io/kinark/dnsimple-mcp"]
-    }
+    "dnsimple": { "type": "http", "url": "http://127.0.0.1:8377/mcp" }
   }
 }
 ```
 
-HTTP, with OAuth on the connection:
+Then authenticate the server in your client (Claude Code: `/mcp` → dnsimple → Authenticate).
 
-```sh
-docker run -d --name dnsimple-mcp -p 8377:8377 -v dnsimple-mcp:/data ghcr.io/kinark/dnsimple-mcp --http
-docker logs dnsimple-mcp        # shows the access key the sign-in page asks for
-```
+To run it as a stdio command instead (sign-in through the `dnsimple_auth_login` tool), add `--stdio`: `docker run -i --rm -v dnsimple-mcp:/data ghcr.io/kinark/dnsimple-mcp --stdio`.
 
 That answers on `http://127.0.0.1:8377/mcp` of the Docker host. To reach it under any other address (another port, a host name, a reverse proxy), say so with `--public-url`; see [Remote and headless hosts](#remote-and-headless-hosts).
 
@@ -162,7 +159,8 @@ The request is checked against the catalog before the CLI runs: unknown commands
 | Option | Effect |
 | --- | --- |
 | `--context <name>` or `DNSIMPLE_MCP_CONTEXT` | Pin every call to one stored CLI context (safe alongside other agents; disables switching). |
-| `--http`, `--port <n>` or `DNSIMPLE_MCP_PORT` | Serve over HTTP with OAuth on the connection (default port 8377). |
+| `--http` / `--stdio` or `DNSIMPLE_MCP_TRANSPORT` | Transport (default stdio; `http` in the Docker image). |
+| `--port <n>` or `DNSIMPLE_MCP_PORT` | Serve over HTTP with OAuth on the connection (default port 8377). |
 | `--host <addr>` or `DNSIMPLE_MCP_HOST` | With `--http`: address to bind (default `127.0.0.1`; `0.0.0.0` in the Docker image). |
 | `--public-url <url>` or `DNSIMPLE_MCP_PUBLIC_URL` | With `--http`: the base URL clients reach the server at. OAuth metadata is built from it. |
 | `--allowed-hosts <h1,h2>` or `DNSIMPLE_MCP_ALLOWED_HOSTS` | With `--http`: further `Host` header values to answer to (`name` or `name:port`). |
@@ -184,7 +182,7 @@ npm test
 npm run test:docker   # builds the image and drives it; needs Docker
 ```
 
-`npm run test:docker` builds the image and talks to it as a host would: `initialize` and `tools/list` over `docker run -i`, the headless sign-in link from the real CLI, and `--http` in a detached container. A `v*` tag publishes the image for both architectures.
+`npm run test:docker` builds the image and talks to it as a host would: HTTP (the default) in a detached container, and `initialize`, `tools/list` and the headless sign-in link from the real CLI over `docker run -i --stdio`. A `v*` tag publishes the image for both architectures.
 
 `npm test` has layers: catalog parsing against a recorded CLI reference, end-to-end MCP calls over stdio against a fake CLI (asserting the exact argv), the HTTP server's whole OAuth flow (discovery, registration, sign-in through the fake CLI's login, PKCE, refresh, logout) including an SDK client that authenticates by itself, the headless sign-in (the fake CLI listens on loopback as the real one does; a pasted address with the wrong host, port or state, or for an expired login, is refused before it reaches the CLI), HTTP mode behind a public URL and host allow-list, and live tests against the installed CLI. The live tests are read-only, skip themselves when the CLI is missing or signed out, and exercise the OAuth login in a throwaway `HOME` without opening a browser.
 

@@ -34,6 +34,7 @@ COPY LICENSE README.md ./
 ENV NODE_ENV=production \
     HOME=/data \
     DNSIMPLE_MCP_STATE_DIR=/data/dnsimple-mcp \
+    DNSIMPLE_MCP_TRANSPORT=http \
     DNSIMPLE_MCP_HEADLESS=1 \
     DNSIMPLE_MCP_HOST=0.0.0.0
 RUN mkdir -p /data && chown node:node /data
@@ -41,5 +42,6 @@ VOLUME /data
 USER node
 EXPOSE 8377
 
-# tini reaps the login's child processes and forwards signals.
+# HTTP by default, so the MCP connection itself asks for OAuth; `--stdio`
+# switches to stdio. tini reaps the login's child processes and forwards signals.
 ENTRYPOINT ["tini", "--", "node", "/app/bin/dnsimple-mcp.js"]

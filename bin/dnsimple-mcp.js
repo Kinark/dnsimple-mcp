@@ -12,10 +12,13 @@ Usage:
                [--allowed-hosts <h1,h2>] [--sandbox] [--context <name>]
       HTTP server (127.0.0.1 by default). The MCP connection itself asks for
       OAuth: the client opens a sign-in page that signs you in with DNSimple.
-  dnsimple-mcp [--context <name>]
+  dnsimple-mcp --stdio [--context <name>]
       stdio server. Sign-in happens through the dnsimple_auth_login tool.
+      Without --http or --stdio, DNSIMPLE_MCP_TRANSPORT decides (default stdio;
+      the Docker image sets http).
 
   --http                   Serve MCP over HTTP at http://<host>:<port>/mcp
+  --stdio                  Serve MCP over stdin/stdout
   --port <n>               HTTP port (default 8377; also: DNSIMPLE_MCP_PORT)
   --host <addr>            Address to bind (default 127.0.0.1; also: DNSIMPLE_MCP_HOST)
   --public-url <url>       Base URL clients reach the server at, e.g. https://dns-mcp.example.com.
@@ -26,6 +29,7 @@ Usage:
   --context <name>         Pin every call to one stored CLI context (also: DNSIMPLE_MCP_CONTEXT)
 
 Environment:
+  DNSIMPLE_MCP_TRANSPORT   http or stdio, used when neither flag is given (default stdio)
   DNSIMPLE_BIN             Path to the dnsimple CLI (default: "dnsimple" on PATH)
   DNSIMPLE_MCP_STATE_DIR   Where the HTTP server keeps its client registrations, hashed
                            tokens and access key (default: ~/.local/state/dnsimple-mcp)
@@ -51,7 +55,12 @@ const context = option('--context') || process.env.DNSIMPLE_MCP_CONTEXT || undef
 // Said once at startup; the tools repeat it as an error when called.
 const reportCli = (cli) => cli.catalog().catch((error) => process.stderr.write(`dnsimple-mcp: ${error.message}\n`));
 
-if (argv.includes('--http')) {
+const transport = argv.includes('--http') ? 'http'
+  : argv.includes('--stdio') ? 'stdio'
+  : (process.env.DNSIMPLE_MCP_TRANSPORT || 'stdio').toLowerCase();
+if (transport !== 'http' && transport !== 'stdio') die(`DNSIMPLE_MCP_TRANSPORT must be http or stdio, not "${transport}".`);
+
+if (transport === 'http') {
   const port = Number(option('--port') ?? process.env.DNSIMPLE_MCP_PORT ?? 8377);
   if (!Number.isInteger(port) || port < 0 || port > 65535) die('--port must be a number between 0 and 65535.');
   const host = option('--host') || process.env.DNSIMPLE_MCP_HOST || '127.0.0.1';
